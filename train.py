@@ -15,30 +15,53 @@ from transform import transforms
 from unet import UNet
 from utils import log_images, dsc
 
+import horovod.torch as hvd
+
 
 def main(args):
     makedirs(args)
     snapshotargs(args)
+
+    # horovod
+    hvd.init()
+    verbose = True if hvd.rank() == 0 else False
+    torch.cuda.set_device(hvd.local_rank())
+
     device = torch.device("cpu" if not torch.cuda.is_available() else args.device)
 
-    loader_train, loader_valid = data_loaders(args)
+    loader_train, loader_valid = horovod_data_loaders(args)
+    # loader_train, loader_valid = data_loaders(args)
     loaders = {"train": loader_train, "valid": loader_valid}
 
     unet = UNet(in_channels=Dataset.in_channels, out_channels=Dataset.out_channels)
-    unet.to(device)
+    # unet.to(device)
+    # default to running on device with gpu
+    unet.cuda()
 
     dsc_loss = DiceLoss()
     best_validation_dsc = 0.0
 
-    optimizer = optim.Adam(unet.parameters(), lr=args.lr)
+    optimizer = optim.Adam(unet.parameters(), lr=args.lr * hvd.size())
+    # horovod optimizer
+    optimizer = hvd.DistributedOptimizer(optimizer, 
+                                         named_parameters=unet.named_parameters(),
+                                         op=hvd.Average,
+                                         backward_passes_per_step=1)
 
-    logger = Logger(args.logs)
+    # Broadcast parameters from rank 0 at weight initialization
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+    hvd.broadcast_parameters(unet.state_dict(), root_rank=0)
+
+    # logging
+    logger = Logger(args.logs) if verbose else None
     loss_train = []
     loss_valid = []
 
     step = 0
 
-    for epoch in tqdm(range(args.epochs), total=args.epochs):
+    for epoch in tqdm(range(args.epochs),
+                      desc='Epoch {:3d}/{:3d}'.format(epoch + 1, args.epochs),
+                      total=args.epochs):
         for phase in ["train", "valid"]:
             if phase == "train":
                 unet.train()
@@ -53,7 +76,7 @@ def main(args):
                     step += 1
 
                 x, y_true = data
-                x, y_true = x.to(device), y_true.to(device)
+                x, y_true = x.cuda(), y_true.cuda() # default to GPU.
 
                 optimizer.zero_grad()
 
@@ -62,7 +85,7 @@ def main(args):
 
                     loss = dsc_loss(y_pred, y_true)
 
-                    if phase == "valid":
+                    if phase == "valid" and logger:
                         loss_valid.append(loss.item())
                         y_pred_np = y_pred.detach().cpu().numpy()
                         validation_pred.extend(
@@ -83,15 +106,16 @@ def main(args):
                                 )
 
                     if phase == "train":
-                        loss_train.append(loss.item())
+                        if logger:
+                            loss_train.append(loss.item())
                         loss.backward()
                         optimizer.step()
 
-                if phase == "train" and (step + 1) % 10 == 0:
+                if phase == "train" and (step + 1) % 10 == 0 and logger:
                     log_loss_summary(logger, loss_train, step)
                     loss_train = []
 
-            if phase == "valid":
+            if phase == "valid" and logger:
                 log_loss_summary(logger, loss_valid, step, prefix="val_")
                 mean_dsc = np.mean(
                     dsc_per_volume(
@@ -108,6 +132,41 @@ def main(args):
 
     print("Best validation mean DSC: {:4f}".format(best_validation_dsc))
 
+def horovod_data_loaders(args):
+    dataset_train, dataset_valid = datasets(args)
+
+    # init training set's dataloader
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        dataset_train,
+        num_replicas=hvd.size(),
+        rank=hvd.rank()
+    )
+    train_loader = DataLoader(
+        dataset_train,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.workers,
+        worker_init_fn=worker_init,
+        sampler=train_sampler
+    )
+
+    # init validation set's dataloader
+    val_sampler = torch.utils.data.distributed.DistributedSampler(
+        dataset_valid,
+        num_replicas=hvd.size(),
+        rank=hvd.rank()
+    )
+    valid_loader = DataLoader(
+        dataset_valid,
+        batch_size=args.batch_size,
+        drop_last=False,
+        num_workers=args.workers,
+        worker_init_fn=worker_init,
+        sampler=train_sampler
+    )
+
+    return train_loader, valid_loader
 
 def data_loaders(args):
     dataset_train, dataset_valid = datasets(args)
