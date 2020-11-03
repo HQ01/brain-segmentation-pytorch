@@ -21,7 +21,7 @@ class BrainSegmentationDataset(Dataset):
         transform=None,
         image_size=256,
         subset="train",
-        random_sampling=True,
+        random_sampling=False,
         validation_cases=10,
         seed=42,
     ):
@@ -104,6 +104,7 @@ class BrainSegmentationDataset(Dataset):
         self.random_sampling = random_sampling
 
         self.transform = transform
+        print("ATTENTION::DATASET, dataset length is ", len(self.patient_slice_index))
 
     def __len__(self):
         return len(self.patient_slice_index)

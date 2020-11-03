@@ -21,6 +21,7 @@ import horovod.torch as hvd
 def main(args):
     makedirs(args)
     snapshotargs(args)
+    print("start training!")
 
     # horovod
     hvd.init()
@@ -29,7 +30,8 @@ def main(args):
 
     device = torch.device("cpu" if not torch.cuda.is_available() else args.device)
 
-    loader_train, loader_valid = horovod_data_loaders(args)
+    loader_train, loader_valid, sampler_train, sampler_valid = horovod_data_loaders(args)
+    print("rank : {}, data loading finished".format(hvd.local_rank()))
     # loader_train, loader_valid = data_loaders(args)
     loaders = {"train": loader_train, "valid": loader_valid}
 
@@ -37,6 +39,7 @@ def main(args):
     # unet.to(device)
     # default to running on device with gpu
     unet.cuda()
+    print("rank : {}, model initialize finished".format(hvd.local_rank()))
 
     dsc_loss = DiceLoss()
     best_validation_dsc = 0.0
@@ -53,23 +56,28 @@ def main(args):
     hvd.broadcast_parameters(unet.state_dict(), root_rank=0)
 
     # logging
-    logger = Logger(args.logs) if verbose else None
+    logger = Logger(args.logs) if verbose and hvd.local_rank() == 0 else None
     loss_train = []
     loss_valid = []
 
     step = 0
 
     for epoch in tqdm(range(args.epochs),
-                      desc='Epoch {:3d}/{:3d}'.format(epoch + 1, args.epochs),
                       total=args.epochs):
         for phase in ["train", "valid"]:
+            # skip evaluation if not process 0
+            if phase == "valid" and hvd.local_rank() != 0:
+                continue
             if phase == "train":
                 unet.train()
+                sampler_train.set_epoch(epoch)
             else:
                 unet.eval()
 
             validation_pred = []
             validation_true = []
+            train_pred = []
+            train_true = []
 
             for i, data in enumerate(loaders[phase]):
                 if phase == "train":
@@ -105,6 +113,16 @@ def main(args):
                                     step,
                                 )
 
+                    # if phase == "train" and logger:
+                    #     y_train_np = y_pred.detach().cpu().numpy()
+                    #     train_pred.extend(
+                    #         [y_train_np[s] for s in range(y_train_np.shape[0])]
+                    #     )
+                    #     y_true_np = y_true.detach().cpu().numpy()
+                    #     train_true.extend(
+                    #         [y_true_np[s] for s in range(y_true_np.shape[0])]
+                    #     )
+
                     if phase == "train":
                         if logger:
                             loss_train.append(loss.item())
@@ -114,9 +132,24 @@ def main(args):
                 if phase == "train" and (step + 1) % 10 == 0 and logger:
                     log_loss_summary(logger, loss_train, step)
                     loss_train = []
+                if phase == "train" and (step + 1) % args.loss_print_frequency == 0:
+                    print("rank {}, train loss type {}, value {}".format(hvd.local_rank(), type(loss), loss.item()))
+                    print("data size is ", x.size())
+
+            # if phase == "train" and logger:
+            #     print("check training dsc per volume")
+            #     mean_dsc = np.mean(
+            #         dsc_per_volume(
+            #             train_pred,
+            #             train_true,
+            #             loader_train.dataset.patient_slice_index,
+            #         )
+            #     )
+            #     print("rank {}, type {}, train mean dsc value is {}".format(hvd.local_rank(), type(mean_dsc), mean_dsc))
 
             if phase == "valid" and logger:
                 log_loss_summary(logger, loss_valid, step, prefix="val_")
+                print("check validation dsc per volume")
                 mean_dsc = np.mean(
                     dsc_per_volume(
                         validation_pred,
@@ -124,6 +157,7 @@ def main(args):
                         loader_valid.dataset.patient_slice_index,
                     )
                 )
+                print("rank {}, type {}, val mean dsc value is {}".format(hvd.local_rank(), type(mean_dsc), mean_dsc))
                 logger.scalar_summary("val_dsc", mean_dsc, step)
                 if mean_dsc > best_validation_dsc:
                     best_validation_dsc = mean_dsc
@@ -135,6 +169,9 @@ def main(args):
 def horovod_data_loaders(args):
     dataset_train, dataset_valid = datasets(args)
 
+    def worker_init(worker_id):
+        np.random.seed(42 + worker_id)
+
     # init training set's dataloader
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         dataset_train,
@@ -144,7 +181,7 @@ def horovod_data_loaders(args):
     train_loader = DataLoader(
         dataset_train,
         batch_size=args.batch_size,
-        shuffle=True,
+        # shuffle=True,
         drop_last=True,
         num_workers=args.workers,
         worker_init_fn=worker_init,
@@ -152,21 +189,30 @@ def horovod_data_loaders(args):
     )
 
     # init validation set's dataloader
-    val_sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset_valid,
-        num_replicas=hvd.size(),
-        rank=hvd.rank()
-    )
+
+    # valid_sampler = torch.utils.data.distributed.DistributedSampler(
+    #     dataset_valid,
+    #     num_replicas=hvd.size(),
+    #     rank=hvd.rank()
+    # )
+    # non distributed version of validation since we need the whole dataset to calculate related metric.
     valid_loader = DataLoader(
         dataset_valid,
         batch_size=args.batch_size,
         drop_last=False,
         num_workers=args.workers,
         worker_init_fn=worker_init,
-        sampler=train_sampler
     )
+    # valid_loader = DataLoader(
+    #     dataset_valid,
+    #     batch_size=args.batch_size,
+    #     drop_last=False,
+    #     num_workers=args.workers,
+    #     worker_init_fn=worker_init,
+    #     sampler=valid_sampler
+    # )
 
-    return train_loader, valid_loader
+    return train_loader, valid_loader, train_sampler, None
 
 def data_loaders(args):
     dataset_train, dataset_valid = datasets(args)
@@ -177,7 +223,7 @@ def data_loaders(args):
     loader_train = DataLoader(
         dataset_train,
         batch_size=args.batch_size,
-        shuffle=True,
+        # shuffle=True,
         drop_last=True,
         num_workers=args.workers,
         worker_init_fn=worker_init,
@@ -213,10 +259,14 @@ def dsc_per_volume(validation_pred, validation_true, patient_slice_index):
     dsc_list = []
     num_slices = np.bincount([p[0] for p in patient_slice_index])
     index = 0
+    print("total example in val set is {}, total num of slices is {}".format(len(validation_pred), sum(num_slices)))
     for p in range(len(num_slices)):
         y_pred = np.array(validation_pred[index : index + num_slices[p]])
         y_true = np.array(validation_true[index : index + num_slices[p]])
+        print("y_pred statistics: min {}, max {}, avg {}".format(np.min(y_pred), np.max(y_pred), np.mean(y_pred)))
+        print("y_true statistics: min {}, max {}, avg {}".format(np.min(y_true), np.max(y_true), np.mean(y_true)))
         dsc_list.append(dsc(y_pred, y_true))
+        print("latest dsc result is ", dsc_list[-1])
         index += num_slices[p]
     return dsc_list
 
@@ -267,7 +317,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--workers",
         type=int,
-        default=4,
+        default=1,
         help="number of workers for data loading (default: 4)",
     )
     parser.add_argument(
@@ -308,6 +358,12 @@ if __name__ == "__main__":
         type=int,
         default=15,
         help="rotation angle range in degrees for augmentation (default: 15)",
+    )
+    parser.add_argument(
+        "--loss-print-frequency",
+        type=int,
+        default=10,
+        help="how many step do we print the training loss",
     )
     args = parser.parse_args()
     main(args)
