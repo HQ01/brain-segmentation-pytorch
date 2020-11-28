@@ -146,16 +146,6 @@ def main(args):
                                     step,
                                 )
 
-                    # if phase == "train" and logger:
-                    #     y_train_np = y_pred.detach().cpu().numpy()
-                    #     train_pred.extend(
-                    #         [y_train_np[s] for s in range(y_train_np.shape[0])]
-                    #     )
-                    #     y_true_np = y_true.detach().cpu().numpy()
-                    #     train_true.extend(
-                    #         [y_true_np[s] for s in range(y_true_np.shape[0])]
-                    #     )
-
                     if phase == "train":
                         for idx in range(0, len(x), args.batch_size):
                             x_batch = x[idx:idx + args.batch_size]
@@ -175,21 +165,6 @@ def main(args):
                 if phase == "train" and (step + 1) % 10 == 0 and logger:
                     log_loss_summary(logger, loss_train, step)
                     loss_train = []
-                # if phase == "train" and (step + 1) % args.loss_print_frequency == 0:
-                    # print("rank {}, train loss type {}, value {}".format(hvd.local_rank(), type(loss), loss.item()))
-                    # print("data size is {}, batch size is {}".format(x.size(), args.batch_size))
-
-            # if phase == "train" and logger:
-            #     print("check training dsc per volume")
-            #     mean_dsc = np.mean(
-            #         dsc_per_volume(
-            #             train_pred,
-            #             train_true,
-            #             loader_train.dataset.patient_slice_index,
-            #         )
-            #     )
-            #     print("rank {}, type {}, train mean dsc value is {}".format(hvd.local_rank(), type(mean_dsc), mean_dsc))
-
             if phase == "valid" and logger:
                 log_loss_summary(logger, loss_valid, step, prefix="val_")
                 mean_dsc = np.mean(
@@ -199,7 +174,6 @@ def main(args):
                         loader_valid.dataset.patient_slice_index,
                     )
                 )
-                #if (step + 1) % args.loss_print_frequency == 0:
                 print("check validation dsc per volume")
                 print("rank {}, type {}, val mean dsc value is {}".format(hvd.local_rank(), type(mean_dsc), mean_dsc))
                 logger.scalar_summary("val_dsc", mean_dsc, step)
@@ -237,12 +211,6 @@ def horovod_data_loaders(args, kwargs):
     )
 
     # init validation set's dataloader
-
-    # valid_sampler = torch.utils.data.distributed.DistributedSampler(
-    #     dataset_valid,
-    #     num_replicas=hvd.size(),
-    #     rank=hvd.rank()
-    # )
     # non distributed version of validation since we need the whole dataset to calculate related metric.
     valid_loader = DataLoader(
         dataset_valid,
@@ -251,18 +219,11 @@ def horovod_data_loaders(args, kwargs):
         num_workers=args.workers,
         worker_init_fn=worker_init,
     )
-    # valid_loader = DataLoader(
-    #     dataset_valid,
-    #     batch_size=args.batch_size,
-    #     drop_last=False,
-    #     num_workers=args.workers,
-    #     worker_init_fn=worker_init,
-    #     sampler=valid_sampler
-    # )
 
     return train_loader, valid_loader, train_sampler, None
 
 def data_loaders(args):
+    # non distributed version
     dataset_train, dataset_valid = datasets(args)
 
     def worker_init(worker_id):
@@ -271,7 +232,6 @@ def data_loaders(args):
     loader_train = DataLoader(
         dataset_train,
         batch_size=args.batch_size,
-        # shuffle=True,
         drop_last=True,
         num_workers=args.workers,
         worker_init_fn=worker_init,
@@ -307,14 +267,10 @@ def dsc_per_volume(validation_pred, validation_true, patient_slice_index):
     dsc_list = []
     num_slices = np.bincount([p[0] for p in patient_slice_index])
     index = 0
-    # print("total example in val set is {}, total num of slices is {}".format(len(validation_pred), sum(num_slices)))
     for p in range(len(num_slices)):
         y_pred = np.array(validation_pred[index : index + num_slices[p]])
         y_true = np.array(validation_true[index : index + num_slices[p]])
-        # print("y_pred statistics: min {}, max {}, avg {}".format(np.min(y_pred), np.max(y_pred), np.mean(y_pred)))
-        # print("y_true statistics: min {}, max {}, avg {}".format(np.min(y_true), np.max(y_true), np.mean(y_true)))
         dsc_list.append(dsc(y_pred, y_true))
-        # print("latest dsc result is ", dsc_list[-1])
         index += num_slices[p]
     return dsc_list
 

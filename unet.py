@@ -43,9 +43,7 @@ class UNet(nn.Module):
         )
 
     def forward(self, x):
-        # print("x shape is ", x.size())
         enc1 = self.encoder1(x)
-        # print("enc shape is ", enc1.size())
         enc2 = self.encoder2(self.pool1(enc1))
         enc3 = self.encoder3(self.pool2(enc2))
         enc4 = self.encoder4(self.pool3(enc3))
