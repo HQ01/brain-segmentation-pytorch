@@ -22,6 +22,7 @@ import kfac
 
 
 def main(args):
+    # torch.multiprocessing.set_start_method('spawn')
     makedirs(args)
     snapshotargs(args)
     print("start training!")
@@ -41,23 +42,25 @@ def main(args):
     kwargs = {'num_workers': 4, 'pin_memory': True} if cuda_avail else {}
 
     loader_train, loader_valid, sampler_train, sampler_valid = horovod_data_loaders(args, kwargs)
-    print("rank : {}, data loading finished".format(hvd.local_rank()))
+    print("rank : {}, data loading finished".format(hvd.rank()))
     loaders = {"train": loader_train, "valid": loader_valid}
 
     unet = UNet(in_channels=Dataset.in_channels, out_channels=Dataset.out_channels)
     if cuda_avail:
         unet.cuda()
     
-    print("rank : {}, model initialize finished".format(hvd.local_rank()))
+    print("rank : {}, model initialize finished".format(hvd.rank()))
 
     dsc_loss = DiceLoss()
     best_validation_dsc = 0.0
 
     use_kfac = True if args.kfac_update_freq > 0 else False
+    # use_kfac = False
     if use_kfac:
         # base lr in original distributed k-fac paper is 0.1
-        optimizer = optim.SGD(unet.parameters(), lr=args.base_lr * hvd.size(), momentum=args.momentum,
-                        weight_decay=args.weight_decay)
+        # optimizer = optim.SGD(unet.parameters(), lr=args.base_lr * hvd.size(), momentum=args.momentum,
+        #                weight_decay=args.weight_decay)
+        optimizer = optim.Adam(unet.parameters(), lr=args.base_lr * hvd.size())
         preconditioner = kfac.KFAC(unet, lr=args.base_lr * hvd.size(), factor_decay=args.stat_decay, 
                                damping=args.damping, kl_clip=args.kl_clip, 
                                fac_update_freq=args.kfac_cov_update_freq, 
@@ -79,7 +82,9 @@ def main(args):
                                          backward_passes_per_step=args.batches_per_allreduce)
 
     # Broadcast parameters from rank 0 at weight initialization
+    print("######{}, before hvd broadcast optimizer state".format(hvd.rank()))
     hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+    print("#####{}, before hvd broadcast params".format(hvd.rank()))
     hvd.broadcast_parameters(unet.state_dict(), root_rank=0)
     if use_kfac:
         #without kfac, default to adam
@@ -88,17 +93,18 @@ def main(args):
         lr_scheduler.append(LambdaLR(preconditioner, lrs))
 
     # logging
-    logger = Logger(args.logs) if verbose and hvd.local_rank() == 0 else None
+    logger = Logger(args.logs) if verbose and hvd.rank() == 0 else None
     loss_train = []
     loss_valid = []
 
     step = 0
+    print("#####{}, before starting epoch".format(hvd.rank()))
 
     for epoch in tqdm(range(args.epochs),
                       total=args.epochs):
         for phase in ["train", "valid"]:
             # skip evaluation if not process 0
-            if phase == "valid" and hvd.local_rank() != 0:
+            if phase == "valid" and hvd.rank() != 0:
                 continue
             if phase == "train":
                 unet.train()
@@ -110,8 +116,9 @@ def main(args):
             validation_true = []
             train_pred = []
             train_true = []
-
+            print("!!!!!! {}, {}".format(hvd.rank(), epoch))
             for i, data in enumerate(loaders[phase]):
+                print("####### {}, {}, {} #######".format(epoch, hvd.rank(), i))
                 if phase == "train":
                     step += 1
 
@@ -175,14 +182,15 @@ def main(args):
                     )
                 )
                 print("check validation dsc per volume")
-                print("rank {}, type {}, val mean dsc value is {}".format(hvd.local_rank(), type(mean_dsc), mean_dsc))
+                print("rank {}, type {}, val mean dsc value is {}".format(hvd.rank(), type(mean_dsc), mean_dsc))
                 logger.scalar_summary("val_dsc", mean_dsc, step)
                 if mean_dsc > best_validation_dsc:
                     best_validation_dsc = mean_dsc
                     torch.save(unet.state_dict(), os.path.join(args.weights, "unet.pt"))
                 loss_valid = []
-            for scheduler in lr_scheduler:
-                scheduler.step()
+            if use_kfac:
+                for scheduler in lr_scheduler:
+                    scheduler.step()
             if use_kfac:
                 kfac_param_scheduler.step(epoch)
 
@@ -304,6 +312,7 @@ def create_lr_schedule(workers, warmup_epochs, decay_schedule, alpha=0.1):
 
 
 if __name__ == "__main__":
+    torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser(
         description="Training U-Net model for segmentation of brain MRI"
     )
@@ -409,15 +418,15 @@ if __name__ == "__main__":
     parser.add_argument('--weight-decay', type=float, default=5e-4, metavar='W',
                         help='SGD weight decay (default: 5e-4)')
     # KFAC Parameters
-    parser.add_argument('--kfac-update-freq', type=int, default=500,
+    parser.add_argument('--kfac-update-freq', type=int, default=200,
                         help='iters between kfac inv ops (0 for no kfac updates) (default: 10)')
-    parser.add_argument('--kfac-cov-update-freq', type=int, default=50,
+    parser.add_argument('--kfac-cov-update-freq', type=int, default=20,
                         help='iters between kfac cov ops (default: 1)')
     parser.add_argument('--kfac-update-freq-alpha', type=float, default=10,
                         help='KFAC update freq multiplier (default: 10)')
     parser.add_argument('--kfac-update-freq-schedule', nargs='+', type=int, default=None,
                         help='KFAC update freq schedule (default None)')
-    parser.add_argument('--stat-decay', type=float, default=0.93,
+    parser.add_argument('--stat-decay', type=float, default=0.95,
                         help='Alpha value for covariance accumulation (default: 0.95)')
     # 0.92 > 0.93 ~= 0.80 (but converges much faster) ~= 0.60  ~= 0.50 > 0.90 > 0.70 > 0.20
     parser.add_argument('--damping', type=float, default=0.003,
