@@ -25,7 +25,7 @@ def main(args):
     # torch.multiprocessing.set_start_method('spawn')
     makedirs(args)
     snapshotargs(args)
-    print("start training!")
+    # print("start training!")
     cuda_avail = torch.cuda.is_available()
 
     # horovod
@@ -42,14 +42,14 @@ def main(args):
     kwargs = {'num_workers': 4, 'pin_memory': True} if cuda_avail else {}
 
     loader_train, loader_valid, sampler_train, sampler_valid = horovod_data_loaders(args, kwargs)
-    print("rank : {}, data loading finished".format(hvd.rank()))
+    # print("rank : {}, data loading finished".format(hvd.rank()))
     loaders = {"train": loader_train, "valid": loader_valid}
 
     unet = UNet(in_channels=Dataset.in_channels, out_channels=Dataset.out_channels)
     if cuda_avail:
         unet.cuda()
     
-    print("rank : {}, model initialize finished".format(hvd.rank()))
+    # print("rank : {}, model initialize finished".format(hvd.rank()))
 
     dsc_loss = DiceLoss()
     best_validation_dsc = 0.0
@@ -82,9 +82,9 @@ def main(args):
                                          backward_passes_per_step=args.batches_per_allreduce)
 
     # Broadcast parameters from rank 0 at weight initialization
-    print("######{}, before hvd broadcast optimizer state".format(hvd.rank()))
+    # print("######{}, before hvd broadcast optimizer state".format(hvd.rank()))
     hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-    print("#####{}, before hvd broadcast params".format(hvd.rank()))
+    # print("#####{}, before hvd broadcast params".format(hvd.rank()))
     hvd.broadcast_parameters(unet.state_dict(), root_rank=0)
     if use_kfac:
         #without kfac, default to adam
@@ -98,7 +98,7 @@ def main(args):
     loss_valid = []
 
     step = 0
-    print("#####{}, before starting epoch".format(hvd.rank()))
+    # print("#####{}, before starting epoch".format(hvd.rank()))
 
     for epoch in tqdm(range(args.epochs),
                       total=args.epochs):
@@ -116,9 +116,9 @@ def main(args):
             validation_true = []
             train_pred = []
             train_true = []
-            print("!!!!!! {}, {}".format(hvd.rank(), epoch))
+            # print("!!!!!! {}, {}".format(hvd.rank(), epoch))
             for i, data in enumerate(loaders[phase]):
-                print("####### {}, {}, {} #######".format(epoch, hvd.rank(), i))
+                # print("####### {}, {}, {} #######".format(epoch, hvd.rank(), i))
                 if phase == "train":
                     step += 1
 
@@ -181,7 +181,7 @@ def main(args):
                         loader_valid.dataset.patient_slice_index,
                     )
                 )
-                print("check validation dsc per volume")
+                # print("check validation dsc per volume")
                 print("rank {}, type {}, val mean dsc value is {}".format(hvd.rank(), type(mean_dsc), mean_dsc))
                 logger.scalar_summary("val_dsc", mean_dsc, step)
                 if mean_dsc > best_validation_dsc:
@@ -312,7 +312,7 @@ def create_lr_schedule(workers, warmup_epochs, decay_schedule, alpha=0.1):
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.set_start_method('spawn')
+    # torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser(
         description="Training U-Net model for segmentation of brain MRI"
     )
